@@ -46,8 +46,8 @@ RUN microdnf install -y \
 
 WORKDIR /tmp
 
-RUN curl -Ls https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64 -o tini  && \
-    echo "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c  tini" > tini-sha.txt && \
+RUN curl -Ls https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm64 -o tini  && \
+    echo "07952557df20bfd2a95f9bef198b445e006171969499a1d361bd9e6f8e5e0e81  tini" > tini-sha.txt && \
     sha256sum --quiet -c tini-sha.txt && \
     chmod +x tini && \
     mv tini /usr/bin/ && \
@@ -86,7 +86,7 @@ COPY website /tmp/website/
 
 # Install FoundationDB Binaries
 RUN for file in fdbserver fdbbackup fdbcli fdbmonitor; do \
-        curl --fail -Ls ${FDB_WEBSITE}/${FDB_VERSION}/$file.x86_64 -o $file; \
+        curl --fail -Ls ${FDB_WEBSITE}/${FDB_VERSION}/$file.aarch64 -o $file; \
         chmod +x $file; \
         mv $file /usr/bin; \
     done
@@ -98,16 +98,16 @@ RUN for file in fdbdr fdbrestore backup_agent dr_agent fastrestore_tool; do \
 
 # Install additional FoundationDB Client Libraries
 RUN for version in $FDB_LIBRARY_VERSIONS; do \
-    curl --fail -Ls ${FDB_WEBSITE}/${version}/libfdb_c.x86_64.so -o /usr/lib/fdb/multiversion/libfdb_c_${version%.*}.so; \
+    curl --fail -Ls ${FDB_WEBSITE}/${version}/libfdb_c.aarch64.so -o /usr/lib/fdb/multiversion/libfdb_c_${version%.*}.so; \
     done
 
 # Install additional FoundationDB Client Libraries (for sidecar)
 RUN mkdir -p /var/fdb/lib && \
     for version in $FDB_LIBRARY_VERSIONS; do \
-    curl --fail -Ls ${FDB_WEBSITE}/${version}/libfdb_c.x86_64.so -o /var/fdb/lib/libfdb_c_${version%.*}.so; \
+    curl --fail -Ls ${FDB_WEBSITE}/${version}/libfdb_c.aarch64.so -o /var/fdb/lib/libfdb_c_${version%.*}.so; \
     done
 
-RUN curl -Ls $FDB_WEBSITE/$FDB_VERSION/libfdb_c.x86_64.so -o /usr/lib/libfdb_c.so
+RUN curl -Ls $FDB_WEBSITE/$FDB_VERSION/libfdb_c.aarch64.so -o /usr/lib/libfdb_c.so
 
 RUN rm -rf /tmp/*
 WORKDIR /
@@ -144,7 +144,7 @@ RUN chmod a+x /entrypoint.bash /sidecar.py
 USER fdb
 VOLUME /var/input-files
 VOLUME /var/output-files
-ENV LISTEN_PORT 8080
+ENV LISTEN_PORT=8080
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/entrypoint.bash"]
 
 FROM foundationdb-base AS foundationdb
@@ -163,47 +163,11 @@ WORKDIR /
 ADD fdb.bash fdb_single.bash /var/fdb/scripts/
 RUN chmod a+x /var/fdb/scripts/fdb.bash /var/fdb/scripts/fdb_single.bash
 VOLUME /var/fdb/data
-ENV FDB_PORT 4500
-ENV FDB_CLUSTER_FILE /var/fdb/fdb.cluster
-ENV FDB_NETWORKING_MODE container
-ENV FDB_COORDINATOR ""
-ENV FDB_COORDINATOR_PORT 4500
-ENV FDB_CLUSTER_FILE_CONTENTS ""
-ENV FDB_PROCESS_CLASS unset
+ENV FDB_PORT=4500
+ENV FDB_CLUSTER_FILE=/var/fdb/fdb.cluster
+ENV FDB_NETWORKING_MODE=container
+ENV FDB_COORDINATOR=""
+ENV FDB_COORDINATOR_PORT=4500
+ENV FDB_CLUSTER_FILE_CONTENTS=""
+ENV FDB_PROCESS_CLASS=unset
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/var/fdb/scripts/fdb.bash"]
-
-FROM foundationdb-base AS ycsb
-
-RUN microdnf -y install \
-    java-11-openjdk java-11-openjdk-devel && \
-    microdnf clean all && \
-    rm -rf /var/cache/yum
-
-WORKDIR /tmp
-RUN NO_PROXY="" no_proxy="" curl -Ls https://s3.us-west-2.amazonaws.com/amazon-eks/1.22.6/2022-03-09/bin/linux/amd64/kubectl -o kubectl && \
-    echo "860c3d37a5979491895767e7332404d28dc0d7797c7673c33df30ca80e215a07  kubectl" > kubectl.txt && \
-    sha256sum --quiet -c kubectl.txt && \
-    mv kubectl /usr/local/bin/kubectl && \
-    chmod 755 /usr/local/bin/kubectl && \
-    curl -Ls https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.7.34.zip -o "awscliv2.zip" && \
-    echo "daf9253f0071b5cfee9532bc5220bedd7a5d29d4e0f92b42b9e3e4c496341e88  awscliv2.zip" > awscliv2.txt && \
-    sha256sum --quiet -c awscliv2.txt && \
-    unzip -qq awscliv2.zip && \
-    ./aws/install && \
-    rm -rf /tmp/*
-
-# TODO: Log4J complains that it's eating the HTracer logs.  Even without it, we get per-operation
-# time series graphs of throughput, median, 90, 99, 99.9 and 99.99 (in usec).
-ADD run_ycsb.sh run_ycsb_standalone.sh /usr/local/bin
-RUN mkdir -p /var/log/fdb-trace-logs && \
-    chmod +x /usr/local/bin/run_ycsb.sh && \
-    chmod +x /usr/local/bin/run_ycsb_standalone.sh
-
-
-ADD YCSB /YCSB
-WORKDIR /YCSB
-ENV FDB_NETWORK_OPTION_EXTERNAL_CLIENT_DIRECTORY=/var/dynamic-conf/lib/multiversion/
-ENV FDB_NETWORK_OPTION_TRACE_ENABLE=/var/log/fdb-trace-logs
-ENV LD_LIBRARY_PATH=/var/dynamic-conf/lib/
-ENV BUCKET=""
-ENTRYPOINT ["run_ycsb.sh"]
