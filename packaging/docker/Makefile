@@ -20,7 +20,8 @@ push-fdb: build-fdb
 # sidecar
 #
 
-%-sidecar: IMAGE = fdb-sidecar-arm:$(FDB_VERSION)
+# sidecar image needs the -1 suffix
+%-sidecar: IMAGE = fdb-sidecar-arm:$(FDB_VERSION)-1
 build-sidecar:
 	docker build --build-arg FDB_VERSION=$(FDB_VERSION) --tag $(IMAGE) --target foundationdb-kubernetes-sidecar .
 push-sidecar: build-sidecar
