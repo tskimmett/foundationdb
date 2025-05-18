@@ -41,6 +41,7 @@ public:
 	int64_t MAX_WRITE_TRANSACTION_LIFE_VERSIONS;
 	bool ENABLE_VERSION_VECTOR;
 	bool ENABLE_VERSION_VECTOR_TLOG_UNICAST;
+	bool ENABLE_VERSION_VECTOR_REPLY_RECOVERY;
 	double MAX_COMMIT_BATCH_INTERVAL; // Each commit proxy generates a CommitTransactionBatchRequest at least this
 	                                  // often, so that versions always advance smoothly
 	double MAX_VERSION_RATE_MODIFIER;
@@ -228,7 +229,6 @@ public:
 	bool ENABLE_DD_PHYSICAL_SHARD; // EXPERIMENTAL; If true, SHARD_ENCODE_LOCATION_METADATA must be true.
 	double DD_PHYSICAL_SHARD_MOVE_PROBABILITY; // Percentage of physical shard move, in the range of [0, 1].
 	bool ENABLE_PHYSICAL_SHARD_MOVE_EXPERIMENT;
-	bool BULKLOAD_ONLY_USE_PHYSICAL_SHARD_MOVE; // If true, bulk load only uses physical shard move
 	int64_t MAX_PHYSICAL_SHARD_BYTES;
 	double PHYSICAL_SHARD_METRICS_DELAY;
 	double ANONYMOUS_PHYSICAL_SHARD_TRANSITION_TIME;
@@ -278,6 +278,9 @@ public:
 	double PERPETUAL_WIGGLE_DELAY; // The max interval between the last wiggle finish and the next wiggle start
 	bool PERPETUAL_WIGGLE_DISABLE_REMOVER; // Whether the start of perpetual wiggle replace team remover
 	bool PERPETUAL_WIGGLE_PAUSE_AFTER_TSS_TARGET_MET;
+	double PERPETUAL_WIGGLE_MIN_AVAILABLE_SPACE_RATIO; // Pause wiggle until all Storage servers have minimumn
+	                                                   // of PERPETUAL_WIGGLE_MIN_AVAILABLE_SPACE_RATIO disk
+	                                                   // space available.
 	double LOG_ON_COMPLETION_DELAY;
 	int BEST_TEAM_MAX_TEAM_TRIES;
 	int BEST_TEAM_OPTION_COUNT;
@@ -395,18 +398,36 @@ public:
 	double DD_FIX_WRONG_REPLICAS_DELAY; // the amount of time between attempts to increase the replication factor of
 	                                    // under replicated shards
 	int BULKLOAD_FILE_BYTES_MAX; // the maximum bytes of files to inject by bulk loading
+	int BULKLOAD_BYTE_SAMPLE_BATCH_KEY_COUNT; // the maximum key count that can be successively sampled when bulkload
 	double DD_BULKLOAD_SHARD_BOUNDARY_CHANGE_DELAY_SEC; // seconds to delay shard boundary change when blocked by bulk
 	                                                    // loading
 	int DD_BULKLOAD_TASK_METADATA_READ_SIZE; // the number of bulk load tasks read from metadata at a time
 	int DD_BULKLOAD_PARALLELISM; // the maximum number of running bulk load tasks
 	double DD_BULKLOAD_SCHEDULE_MIN_INTERVAL_SEC; // the minimal seconds that the bulk load scheduler has to wait
 	                                              // between two rounds
-	int DD_BULKDUMP_TASK_METADATA_READ_SIZE; // the number of bulk dump tasks read from metadata at a time
 	double DD_BULKDUMP_SCHEDULE_MIN_INTERVAL_SEC; // the minimal seconds that the bulk dump scheduler has to wait
 	                                              // between two rounds
+	double DD_BULKLOAD_JOB_MONITOR_PERIOD_SEC; // the seconds that the bulkload job monitor to read the task metadata
+	                                           // when monitoring the task progress
+	int DD_BULKDUMP_BUILD_JOB_MANIFEST_BATCH_SIZE; // the number of lines in a batch when generating bulkload job
+	                                               // manifest file
+	int SS_BULKDUMP_BATCH_COUNT_MAX_PER_REQUEST; // the max number of batch count per bulkdump request to a SS
+	int BULKLOAD_ASYNC_READ_WRITE_BLOCK_SIZE; // the block size when performing async read/write for bulkload
+	int MANIFEST_COUNT_MAX_PER_BULKLOAD_TASK; // the max number of manifest that a bulkload task can process
+	bool BULKLOAD_SIM_FAILURE_INJECTION; // Set to true to inject failure in bulkload simulation
+	double DD_BULKLOAD_POWER_OF_D_RATIO; // When selecting the dest team, DD randomly chooses 1/D portion of all valid
+	                                     // teams as the candidates and the DD selects the team with the minimal number
+	                                     // of ongoing tasks from the candidates as the dest team.
+	double DD_BULKLOAD_TASK_SUBMISSION_INTERVAL_SEC; // the seconds that the bulkload task submitter has to wait
+	                                                 // between two tasks
+	bool CC_ENFORCE_USE_UNFIT_DD_IN_SIM; // Set for CC to enforce to use an unfit DD in the simulation. This knob takes
+	                                     // effect only in the simulation.
+	bool DISABLE_AUDIT_STORAGE_FINAL_REPLICA_CHECK_IN_SIM; // Set to disable audit storage replica check in the
+	                                                       // simulation.
 	int DD_BULKDUMP_PARALLELISM; // the max number of concurrent bulk dump tasks in DD
 	int SS_SERVE_BULKDUMP_PARALLELISM; // the number of bulk dump tasks that can concurrently happen at a SS
 	int64_t SS_BULKDUMP_BATCH_BYTES; // the max bytes when SS creates a batch to dump
+	int SS_BULKLOAD_GETRANGE_BATCH_SIZE; // the max number of keys to scan before do context switch
 
 	// Run storage engine on a child process on the same machine with storage process
 	bool REMOTE_KV_STORE;
@@ -471,6 +492,8 @@ public:
 	bool ROCKSDB_UNSAFE_AUTO_FSYNC;
 	bool ROCKSDB_MUTE_LOGS;
 	int64_t ROCKSDB_PERIODIC_COMPACTION_SECONDS;
+	int64_t ROCKSDB_TTL_COMPACTION_SECONDS;
+	int64_t ROCKSDB_MAX_COMPACTION_BYTES;
 	int ROCKSDB_PREFIX_LEN;
 	double ROCKSDB_MEMTABLE_PREFIX_BLOOM_SIZE_RATIO;
 	int ROCKSDB_BLOOM_BITS_PER_KEY;
@@ -524,6 +547,7 @@ public:
 	int ROCKSDB_SINGLEKEY_DELETES_MAX;
 	bool ROCKSDB_ENABLE_CLEAR_RANGE_EAGER_READS;
 	bool ROCKSDB_FORCE_DELETERANGE_FOR_CLEARRANGE;
+	int ROCKSDB_CLEARRANGES_LIMIT_PER_COMMIT; // Max number of clearranges per commit with rocksdb kvstore.
 	bool ROCKSDB_ENABLE_COMPACT_ON_DELETION;
 	int64_t ROCKSDB_CDCF_SLIDING_WINDOW_SIZE; // CDCF: CompactOnDeletionCollectorFactory
 	int64_t ROCKSDB_CDCF_DELETION_TRIGGER; // CDCF: CompactOnDeletionCollectorFactory
@@ -576,10 +600,10 @@ public:
 	int ROCKSDB_WRITEBATCH_PROTECTION_BYTES_PER_KEY;
 	int ROCKSDB_MEMTABLE_PROTECTION_BYTES_PER_KEY;
 	int ROCKSDB_BLOCK_PROTECTION_BYTES_PER_KEY;
-	bool ROCKSDB_METRICS_IN_SIMULATION; // Whether rocksdb traceevent metrics will be emitted in simulation. Note that
-	                                    // turning this on in simulation could lead to non-deterministic runs since we
-	                                    // rely on rocksdb metadata. This knob also applies to sharded rocks storage
-	                                    // engine.
+	bool ROCKSDB_ENABLE_NONDETERMINISM; // Whether rocksdb nondeterministic behavior should be enabled in simulation.
+	                                    // Note that turning this on in simulation could lead to non-deterministic runs
+	                                    // since we rely on rocksdb metadata. This knob also applies to sharded rocks
+	                                    // storage engine.
 	bool SHARDED_ROCKSDB_ALLOW_WRITE_STALL_ON_FLUSH;
 	int SHARDED_ROCKSDB_MEMTABLE_MAX_RANGE_DELETIONS;
 	double SHARDED_ROCKSDB_VALIDATE_MAPPING_RATIO;
@@ -596,6 +620,7 @@ public:
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_BASE;
 	int SHARDED_ROCKSDB_TARGET_FILE_SIZE_MULTIPLIER;
 	bool SHARDED_ROCKSDB_SUGGEST_COMPACT_CLEAR_RANGE;
+	int SHARDED_ROCKSDB_COMPACT_ON_RANGE_DELETION_THRESHOLD;
 	int SHARDED_ROCKSDB_MAX_BACKGROUND_JOBS;
 	int64_t SHARDED_ROCKSDB_BLOCK_CACHE_SIZE;
 	double SHARDED_ROCKSDB_CACHE_HIGH_PRI_POOL_RATIO;
@@ -609,9 +634,14 @@ public:
 	int SHARDED_ROCKSDB_LEVEL0_STOP_WRITES_TRIGGER;
 	bool SHARDED_ROCKSDB_DELAY_COMPACTION_FOR_DATA_MOVE;
 	int SHARDED_ROCKSDB_MAX_OPEN_FILES;
+	int SHARDED_ROCKSDB_COMPACTION_PRI;
 	bool SHARDED_ROCKSDB_READ_ASYNC_IO;
 	int SHARDED_ROCKSDB_PREFIX_LEN;
+	int SHARDED_ROCKSDB_BLOOM_FILTER_BITS;
+	double SHARDED_ROCKSDB_MEMTABLE_BLOOM_FILTER_RATIO;
 	double SHARDED_ROCKSDB_HISTOGRAMS_SAMPLE_RATE;
+	bool SHARDED_ROCKSDB_USE_DIRECT_IO;
+	bool ENFORCE_SHARDED_ROCKSDB_SIM_IF_AVALIABLE; // set to enforce shardedrocks in simulation as much as possible
 
 	// Leader election
 	int MAX_NOTIFICATIONS;
@@ -716,7 +746,7 @@ public:
 	double BACKUP_TIMEOUT; // master's reaction time for backup failure
 	double BACKUP_NOOP_POP_DELAY;
 	int BACKUP_FILE_BLOCK_BYTES;
-	int64_t BACKUP_LOCK_BYTES;
+	int64_t BACKUP_WORKER_LOCK_BYTES;
 	double BACKUP_UPLOAD_DELAY;
 
 	// Cluster Controller
@@ -775,8 +805,9 @@ public:
 	double CC_TRACKING_HEALTH_RECOVERY_INTERVAL; // The number of recovery count should not exceed
 	                                             // CC_MAX_HEALTH_RECOVERY_COUNT within
 	                                             // CC_TRACKING_HEALTH_RECOVERY_INTERVAL.
-	int CC_MAX_HEALTH_RECOVERY_COUNT; // The max number of recoveries can be triggered due to worker health within
-	                                  // CC_TRACKING_HEALTH_RECOVERY_INTERVAL
+	int CC_MAX_HEALTH_RECOVERY_COUNT; // The max number recoveries that can be triggered due to worker
+	                                  // health within CC_TRACKING_HEALTH_RECOVERY_INTERVAL. This count accounts for any
+	                                  // recovery trigger including non-gray failure ones.
 	bool CC_HEALTH_TRIGGER_FAILOVER; // Whether to enable health triggered failover in CC.
 	int CC_FAILOVER_DUE_TO_HEALTH_MIN_DEGRADATION; // The minimum number of degraded servers that can trigger a
 	                                               // failover.
@@ -1430,6 +1461,8 @@ public:
 
 	// Swift: Enable the Swift runtime hooks and use Swift implementations where possible
 	bool FLOW_WITH_SWIFT;
+
+	bool BULK_LOAD_USE_SST_INGEST; // Enable direct SST file ingestion for RocksDB storage engines
 
 	ServerKnobs(Randomize, ClientKnobs*, IsSimulated);
 	void initialize(Randomize, ClientKnobs*, IsSimulated);

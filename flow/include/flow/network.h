@@ -170,7 +170,8 @@ public:
 		enHistogram = 18,
 		enTokenCache = 19,
 		enMetrics = 20,
-		enGrpcServer = 21,
+		enGrpcState = 21,
+		enProxy = 22,
 		COUNT // Add new fields before this enumerator
 	};
 

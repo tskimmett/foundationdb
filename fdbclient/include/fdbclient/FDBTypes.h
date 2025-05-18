@@ -186,11 +186,11 @@ struct TagsAndMessage {
 	}
 
 	// Returns the size of the header, including: msg_length, version.sub, tag_count, tags.
-	int32_t getHeaderSize() const {
-		return sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint16_t) + tags.size() * sizeof(Tag);
+	static int32_t getHeaderSize(int numTags) {
+		return sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint16_t) + numTags * sizeof(Tag);
 	}
 
-	StringRef getMessageWithoutTags() const { return message.substr(getHeaderSize()); }
+	StringRef getMessageWithoutTags() const { return message.substr(getHeaderSize(tags.size())); }
 
 	// Returns the message with the header.
 	StringRef getRawMessage() const { return message; }
@@ -1668,24 +1668,30 @@ struct StorageMetadataType {
 	KeyValueStoreType storeType;
 
 	// no need to serialize part (should be assigned after initialization)
-	bool wrongConfigured = false;
+	// Used only during wiggling to find out if the SS has incorrect storageType
+	// compared to perpetualStorageWiggleType. If perpetualStorageWiggleType is not
+	// set, configuredStorageType is compared to SS storageType.
+	bool wrongConfiguredForWiggle = false;
 
 	StorageMetadataType() : createdTime(0) {}
-	StorageMetadataType(double t, KeyValueStoreType storeType = KeyValueStoreType::END, bool wrongConfigured = false)
-	  : createdTime(t), storeType(storeType), wrongConfigured(wrongConfigured) {}
+	StorageMetadataType(double t,
+	                    KeyValueStoreType storeType = KeyValueStoreType::END,
+	                    bool wrongConfiguredForWiggle = false)
+	  : createdTime(t), storeType(storeType), wrongConfiguredForWiggle(wrongConfiguredForWiggle) {}
 
 	static double currentTime() { return g_network->timer(); }
 
 	bool operator==(const StorageMetadataType& b) const {
-		return createdTime == b.createdTime && storeType == b.storeType && wrongConfigured == b.wrongConfigured;
+		return createdTime == b.createdTime && storeType == b.storeType &&
+		       wrongConfiguredForWiggle == b.wrongConfiguredForWiggle;
 	}
 
 	bool operator<(const StorageMetadataType& b) const {
-		if (wrongConfigured == b.wrongConfigured) {
+		if (wrongConfiguredForWiggle == b.wrongConfiguredForWiggle) {
 			// the older SS has smaller createdTime
 			return createdTime < b.createdTime;
 		}
-		return wrongConfigured > b.wrongConfigured;
+		return wrongConfiguredForWiggle > b.wrongConfiguredForWiggle;
 	}
 
 	bool operator>(const StorageMetadataType& b) const { return b < *this; }

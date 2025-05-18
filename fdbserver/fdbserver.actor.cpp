@@ -134,7 +134,7 @@ enum {
 	OPT_DCID, OPT_MACHINE_CLASS, OPT_BUGGIFY, OPT_VERSION, OPT_BUILD_FLAGS, OPT_CRASHONERROR, OPT_HELP, OPT_NETWORKIMPL, OPT_NOBUFSTDOUT, OPT_BUFSTDOUTERR,
 	OPT_TRACECLOCK, OPT_NUMTESTERS, OPT_DEVHELP, OPT_PRINT_CODE_PROBES, OPT_ROLLSIZE, OPT_MAXLOGS, OPT_MAXLOGSSIZE, OPT_KNOB, OPT_UNITTESTPARAM, OPT_TESTSERVERS, OPT_TEST_ON_SERVERS, OPT_METRICSCONNFILE,
 	OPT_METRICSPREFIX, OPT_LOGGROUP, OPT_LOCALITY, OPT_IO_TRUST_SECONDS, OPT_IO_TRUST_WARN_ONLY, OPT_FILESYSTEM, OPT_PROFILER_RSS_SIZE, OPT_KVFILE,
-	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIAL_FILE, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB, OPT_NO_CONFIG_DB, OPT_FAULT_INJECTION, OPT_PROFILER, OPT_PRINT_SIMTIME,
+	OPT_TRACE_FORMAT, OPT_WHITELIST_BINPATH, OPT_BLOB_CREDENTIALS, OPT_PROXY, OPT_CONFIG_PATH, OPT_USE_TEST_CONFIG_DB, OPT_NO_CONFIG_DB, OPT_FAULT_INJECTION, OPT_PROFILER, OPT_PRINT_SIMTIME,
 	OPT_FLOW_PROCESS_NAME, OPT_FLOW_PROCESS_ENDPOINT, OPT_IP_TRUSTED_MASK, OPT_KMS_CONN_DISCOVERY_URL_FILE, OPT_KMS_CONNECTOR_TYPE, OPT_KMS_REST_ALLOW_NOT_SECURE_CONECTION, OPT_KMS_CONN_VALIDATION_TOKEN_DETAILS,
 	OPT_KMS_CONN_GET_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_LATEST_ENCRYPTION_KEYS_ENDPOINT, OPT_KMS_CONN_GET_BLOB_METADATA_ENDPOINT, OPT_NEW_CLUSTER_KEY, OPT_AUTHZ_PUBLIC_KEY_FILE, OPT_USE_FUTURE_PROTOCOL_VERSION, OPT_CONSISTENCY_CHECK_URGENT_MODE
 };
@@ -220,7 +220,8 @@ CSimpleOpt::SOption g_rgOptions[] = {
 	{ OPT_IO_TRUST_WARN_ONLY,    "--io-trust-warn-only",        SO_NONE },
 	{ OPT_TRACE_FORMAT,          "--trace-format",              SO_REQ_SEP },
 	{ OPT_WHITELIST_BINPATH,     "--whitelist-binpath",         SO_REQ_SEP },
-	{ OPT_BLOB_CREDENTIAL_FILE,  "--blob-credential-file",      SO_REQ_SEP },
+	{ OPT_BLOB_CREDENTIALS,      "--blob-credentials",          SO_REQ_SEP },
+	{ OPT_PROXY,                 "--proxy",                     SO_REQ_SEP },
 	{ OPT_CONFIG_PATH,           "--config-path",               SO_REQ_SEP },
 	{ OPT_USE_TEST_CONFIG_DB,    "--use-test-config-db",        SO_NONE },
 	{ OPT_NO_CONFIG_DB,          "--no-config-db",              SO_NONE },
@@ -698,6 +699,10 @@ static void printUsage(const char* name, bool devhelp) {
 	                 " Machine class (valid options are storage, transaction,"
 	                 " resolution, grv_proxy, commit_proxy, master, test, unset, stateless, log, router,"
 	                 " and cluster_controller).");
+	printOptionUsage("--blob-credentials FILE",
+	                 "File containing blob credentials in JSON format. Can be specified "
+	                 "multiple times for multiple files. See fdbbackup usage for more details.");
+	printOptionUsage("--proxy PROXY:PORT", "IP:port or host:port to proxy server for connecting to external network.");
 	printOptionUsage("--profiler-",
 	                 "Set an actor profiler option. Supported options are:\n"
 	                 "  collector -- None or FluentD (FluentD requires collector_endpoint to be set)\n"
@@ -1104,6 +1109,7 @@ struct CLIOptions {
 	bool fileIoWarnOnly = false;
 	uint64_t rsssize = -1;
 	std::vector<std::string> blobCredentials; // used for fast restore workers & backup workers
+	Optional<std::string> proxy;
 	const char* blobCredsFromENV = nullptr;
 
 	std::string configPath;
@@ -1655,23 +1661,16 @@ private:
 			case OPT_WHITELIST_BINPATH:
 				whitelistBinPaths = args.OptionArg();
 				break;
-			case OPT_BLOB_CREDENTIAL_FILE:
+			case OPT_BLOB_CREDENTIALS:
 				// Add blob credential following backup agent example
 				blobCredentials.push_back(args.OptionArg());
-				printf("blob credential file:%s\n", blobCredentials.back().c_str());
-
-				blobCredsFromENV = getenv("FDB_BLOB_CREDENTIALS");
-				if (blobCredsFromENV != nullptr) {
-					fprintf(stderr, "[WARNING] Set blob credential via env variable is not tested yet\n");
-					TraceEvent(SevError, "FastRestoreGetBlobCredentialFile")
-					    .detail("Reason", "Set blob credential via env variable is not tested yet");
-					StringRef t((uint8_t*)blobCredsFromENV, strlen(blobCredsFromENV));
-					do {
-						StringRef file = t.eat(":");
-						if (file.size() != 0) {
-							blobCredentials.push_back(file.toString());
-						}
-					} while (t.size() != 0);
+				break;
+			case OPT_PROXY:
+				proxy = args.OptionArg();
+				if (!Hostname::isHostname(proxy.get()) && !NetworkAddress::parseOptional(proxy.get()).present()) {
+					fprintf(stderr, "ERROR: proxy format should be either IP:port or host:port\n");
+					printHelpTeaser(argv[0]);
+					flushAndExit(FDB_EXIT_ERROR);
 				}
 				break;
 			case OPT_CONFIG_PATH:
@@ -1796,6 +1795,28 @@ private:
 				}
 				break;
 			}
+			}
+		}
+		// Sets up blob credentials, including one from the environment FDB_BLOB_CREDENTIALS.
+		// Below is top-half of BackupTLSConfig::setupBlobCredentials().
+		const char* blobCredsFromENV = getenv("FDB_BLOB_CREDENTIALS");
+		if (blobCredsFromENV != nullptr) {
+			StringRef t((uint8_t*)blobCredsFromENV, strlen(blobCredsFromENV));
+			do {
+				StringRef file = t.eat(":");
+				if (file.size() != 0)
+					blobCredentials.push_back(file.toString());
+			} while (t.size() != 0);
+		}
+
+		// Sets up proxy from ENV if it is not set by arg.
+		const char* proxyENV = getenv("FDB_PROXY");
+		if (proxyENV != nullptr && !proxy.present()) {
+			proxy = proxyENV;
+			if (!Hostname::isHostname(proxy.get()) && !NetworkAddress::parseOptional(proxy.get()).present()) {
+				fprintf(stderr, "ERROR: proxy format should be either IP:port or host:port\n");
+				printHelpTeaser(argv[0]);
+				flushAndExit(FDB_EXIT_ERROR);
 			}
 		}
 
@@ -2238,9 +2259,9 @@ int main(int argc, char* argv[]) {
 
 			auto dataFolder = opts.dataFolder.size() ? opts.dataFolder : "simfdb";
 			std::vector<std::string> directories = platform::listDirectories(dataFolder);
-			const std::set<std::string> allowedDirectories = {
-				".", "..", "backups", "unittests", "fdbblob", "bulkdump"
-			};
+			const std::set<std::string> allowedDirectories = { ".",       "..",       "backups", "unittests",
+				                                               "fdbblob", "bulkdump", "bulkload" };
+			// bulkdump and bulkload folders are used by bulkloading and bulkdumping simulation tests
 
 			for (const auto& dir : directories) {
 				if (dir.size() != 32 && !allowedDirectories.contains(dir) && dir.find("snap") == std::string::npos) {
@@ -2377,6 +2398,10 @@ int main(int argc, char* argv[]) {
 				}
 			}
 
+			// Update proxy string
+			Optional<std::string>* pProxy = (Optional<std::string>*)g_network->global(INetwork::enProxy);
+			*pProxy = opts.proxy;
+
 			// Call fast restore for the class FastRestoreClass. This is a short-cut to run fast restore in circus
 			if (opts.processClass == ProcessClass::FastRestoreClass) {
 				printf("Run as fast restore worker\n");
@@ -2419,8 +2444,8 @@ int main(int argc, char* argv[]) {
 				// actors.push_back( recurring( []{}, .001 ) );  // for ASIO latency measurement
 #ifdef FLOW_GRPC_ENABLED
 				if (opts.grpcAddressStrs.size() > 0) {
-					auto grpcServer = GrpcServer::initInstance(NetworkAddress::parse(opts.grpcAddressStrs[0]));
-					actors.push_back(grpcServer->run());
+					FlowGrpc::init(&opts.tlsConfig, NetworkAddress::parse(opts.grpcAddressStrs[0]));
+					actors.push_back(GrpcServer::instance()->run());
 				}
 #endif
 				f = stopAfter(waitForAll(actors));

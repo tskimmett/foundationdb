@@ -40,6 +40,7 @@
 FDB_BOOLEAN_PARAM(AssignEmptyRange);
 FDB_BOOLEAN_PARAM(UnassignShard);
 FDB_BOOLEAN_PARAM(EnablePhysicalShardMove);
+FDB_BOOLEAN_PARAM(ConductBulkLoad);
 
 enum class DataMoveType : uint8_t {
 	LOGICAL = 0,
@@ -471,6 +472,9 @@ std::vector<std::pair<UID, Version>> decodeBackupStartedValue(const ValueRef& va
 // 1 = Send a signal to pause/already paused.
 extern const KeyRef backupPausedKey;
 
+// The key to store the maximum version that backup workers popped in NOOP mode.
+extern const KeyRef backupWorkerMaxNoopVersionKey;
+
 //	"\xff/previousCoordinators" = "[[ClusterConnectionString]]"
 //	Set to the encoded structure of the cluster's previous set of coordinators.
 //	Changed when performing quorumChange.
@@ -524,10 +528,22 @@ extern const KeyRef dataDistributionModeKey;
 extern const UID dataDistributionModeLock;
 
 extern const KeyRef bulkLoadModeKey;
-extern const KeyRangeRef bulkLoadKeys;
-extern const KeyRef bulkLoadPrefix;
-const Value bulkLoadStateValue(const BulkLoadState& bulkLoadState);
-BulkLoadState decodeBulkLoadState(const ValueRef& value);
+extern const KeyRangeRef bulkLoadTaskKeys;
+extern const KeyRef bulkLoadTaskPrefix;
+const Value bulkLoadTaskStateValue(const BulkLoadTaskState& bulkLoadTaskState);
+BulkLoadTaskState decodeBulkLoadTaskState(const ValueRef& value);
+
+const Value ssBulkLoadMetadataValue(const SSBulkLoadMetadata& ssBulkLoadMetadata);
+SSBulkLoadMetadata decodeSSBulkLoadMetadata(const ValueRef& value);
+
+extern const KeyRangeRef bulkLoadJobKeys;
+extern const KeyRef bulkLoadJobPrefix;
+const Value bulkLoadJobValue(const BulkLoadJobState& bulkLoadJobState);
+BulkLoadJobState decodeBulkLoadJobState(const ValueRef& value);
+
+extern const KeyRangeRef bulkLoadJobHistoryKeys;
+extern const KeyRef bulkLoadJobHistoryPrefix;
+const Key bulkLoadJobHistoryKeyFor(const UID& jobId);
 
 extern const KeyRef bulkDumpModeKey;
 extern const KeyRangeRef bulkDumpKeys;
@@ -544,7 +560,6 @@ RangeLockStateSet decodeRangeLockStateSet(const ValueRef& value);
 extern const KeyRangeRef rangeLockOwnerKeys;
 extern const KeyRef rangeLockOwnerPrefix;
 const Key rangeLockOwnerKeyFor(const RangeLockOwnerName& ownerUniqueID);
-const RangeLockOwnerName decodeRangeLockOwnerKey(const KeyRef& key);
 const Value rangeLockOwnerValue(const RangeLockOwner& rangeLockOwner);
 RangeLockOwner decodeRangeLockOwner(const ValueRef& value);
 

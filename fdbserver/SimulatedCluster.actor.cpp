@@ -1675,12 +1675,18 @@ void SimulationConfig::setSpecificConfig(const TestConfig& testConfig) {
 // Sets generateFearless and number of dataCenters based on testConfig details
 // The number of datacenters may be overwritten in setRegions
 void SimulationConfig::setDatacenters(const TestConfig& testConfig) {
-	generateFearless =
-	    testConfig.simpleConfig ? false : (testConfig.minimumRegions > 1 || deterministicRandom()->random01() < 0.5);
-	if (testConfig.generateFearless.present()) {
-		// overwrite whatever decision we made before
-		generateFearless = testConfig.generateFearless.get();
+
+#ifdef NO_MULTIREGION_TEST
+	if (testConfig.minimumRegions > 1 || (testConfig.generateFearless.present() && testConfig.generateFearless.get())) {
+		throw internal_error_msg("Test requires multi-region while the flag is turned off in the build process");
 	}
+	generateFearless = false;
+#else
+	generateFearless =
+	    testConfig.generateFearless.present()
+	        ? testConfig.generateFearless.get()
+	        : (!testConfig.simpleConfig && (testConfig.minimumRegions > 1 || deterministicRandom()->random01() < 0.5));
+#endif
 	datacenters =
 	    testConfig.simpleConfig
 	        ? 1
@@ -1846,7 +1852,12 @@ SimulationStorageEngine chooseSimulationStorageEngine(const TestConfig& testConf
 	StringRef reason;
 	SimulationStorageEngine result = SimulationStorageEngine::SIMULATION_STORAGE_ENGINE_INVALID_VALUE;
 
-	if (testConfig.storageEngineType.present()) {
+	if (isEncryptionEnabled) {
+		// Only storage engine supporting encryption is Redwood.
+		reason = "EncryptionEnabled"_sr;
+		result = SimulationStorageEngine::REDWOOD;
+
+	} else if (testConfig.storageEngineType.present()) {
 		reason = "ConfigureSpecified"_sr;
 		result = testConfig.storageEngineType.get();
 		if (testConfig.excludedStorageEngineType(result) ||
@@ -1856,6 +1867,13 @@ SimulationStorageEngine chooseSimulationStorageEngine(const TestConfig& testConf
 			TraceEvent(SevError, "StorageEngineNotSupported").detail("StorageEngineType", result);
 			ASSERT(false);
 		}
+
+	} else if (SERVER_KNOBS->ENFORCE_SHARDED_ROCKSDB_SIM_IF_AVALIABLE &&
+	           testConfig.storageEngineExcludeTypes.find(SimulationStorageEngine::SHARDED_ROCKSDB) ==
+	               testConfig.storageEngineExcludeTypes.end()) {
+		reason = "ENFORCE_SHARDED_ROCKSDB_SIM_IF_AVALIABLE is enabled"_sr;
+		result = SimulationStorageEngine::SHARDED_ROCKSDB;
+
 	} else {
 		std::unordered_set<SimulationStorageEngine> storageEngineAvailable;
 		for (const auto& storageEngine : SIMULATION_STORAGE_ENGINE) {
@@ -1895,12 +1913,6 @@ SimulationStorageEngine chooseSimulationStorageEngine(const TestConfig& testConf
 		if (result == SimulationStorageEngine::SIMULATION_STORAGE_ENGINE_INVALID_VALUE) {
 			UNREACHABLE();
 		}
-	}
-
-	if (isEncryptionEnabled) {
-		// Only storage engine supporting encryption is Redwood.
-		reason = "EncryptionEnabled"_sr;
-		result = SimulationStorageEngine::REDWOOD;
 	}
 
 	TraceEvent(SevInfo, "SimulationStorageEngine")
@@ -2340,10 +2352,12 @@ void SimulationConfig::generateNormalConfig(const TestConfig& testConfig) {
 	setEncryptionAtRestMode(testConfig);
 	setStorageEngine(testConfig);
 	setReplicationType(testConfig);
+#if (!NO_MULTIREGION_TEST)
 	if (!testConfig.singleRegion &&
 	    (generateFearless || (datacenters == 2 && deterministicRandom()->random01() < 0.5))) {
 		setRegions(testConfig);
 	}
+#endif
 	setMachineCount(testConfig);
 	setCoordinators(testConfig);
 
@@ -2927,12 +2941,12 @@ ACTOR void simulationSetupAndRun(std::string dataFolder,
 	state bool allowCreatingTenants = testConfig.allowCreatingTenants;
 
 	if (!SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA &&
-	    // NOTE: PhysicalShardMove and BulkLoading are required to have SHARDED_ROCKSDB storage engine working.
-	    // Inside the TOML file, the SHARD_ENCODE_LOCATION_METADATA is overridden, however, the
-	    // override will not take effect until the test starts. Here, we do an additional check
-	    // for this special simulation test.
+	    // NOTE: PhysicalShardMove and BulkLoading and Bulkdumping are required to have SHARDED_ROCKSDB storage engine
+	    // working. Inside the TOML file, the SHARD_ENCODE_LOCATION_METADATA is overridden, however, the override will
+	    // not take effect until the test starts. Here, we do an additional check for this special simulation test.
 	    (std::string_view(testFile).find("PhysicalShardMove") == std::string_view::npos &&
 	     std::string_view(testFile).find("BulkLoading") == std::string_view::npos &&
+	     std::string_view(testFile).find("BulkDumping") == std::string_view::npos &&
 	     std::string_view(testFile).find("ShardedRocksNondeterministicTest") == std::string_view::npos)) {
 		testConfig.storageEngineExcludeTypes.insert(SimulationStorageEngine::SHARDED_ROCKSDB);
 	}

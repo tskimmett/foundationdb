@@ -286,7 +286,7 @@ private:
 		uniquify(info.tags);
 		keyInfo->insert(insertRange, info);
 		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
-			toCommit->setShardChanged();
+			toCommit->setLogsChanged();
 		}
 	}
 
@@ -587,6 +587,7 @@ private:
 	}
 
 	void checkSetApplyMutationsEndRange(MutationRef m) {
+		// only proceed when see mutation with applyMutationsEndRange
 		if (!m.param1.startsWith(applyMutationsEndRange.begin)) {
 			return;
 		}
@@ -609,6 +610,11 @@ private:
 		auto addPrefixValue = txnStateStore->readValue(uid.withPrefix(applyMutationsAddPrefixRange.begin)).get();
 		auto removePrefixValue = txnStateStore->readValue(uid.withPrefix(applyMutationsRemovePrefixRange.begin)).get();
 		auto beginValue = txnStateStore->readValue(uid.withPrefix(applyMutationsBeginRange.begin)).get();
+		// TraceEvent("BackupAgentBaseApplyMutationsBegin")
+		//     .detail("BeginVersion",
+		//             beginValue.present() ? BinaryReader::fromStringRef<Version>(beginValue.get(), Unversioned()) : 0)
+		//     .detail("EndVersion", p.endVersion)
+		//     .log();
 		p.worker = applyMutations(
 		    cx,
 		    uid,
@@ -649,6 +655,11 @@ private:
 		}
 		if (!initialCommit)
 			txnStateStore->set(KeyValueRef(m.param1, m.param2));
+
+		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
+			toCommit->setLogsChanged();
+		}
+
 		if (!vecBackupKeys) {
 			return;
 		}
@@ -967,7 +978,7 @@ private:
 			                    ? ServerCacheInfo()
 			                    : keyInfo->rangeContainingKeyBefore(clearRange.begin).value());
 			if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
-				toCommit->setShardChanged();
+				toCommit->setLogsChanged();
 			}
 		}
 
@@ -1183,6 +1194,10 @@ private:
 		    .detail("RangeEnd", range.end)
 		    .detail("IntersectBegin", commonLogRange.begin)
 		    .detail("IntersectEnd", commonLogRange.end);
+
+		if (toCommit && SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
+			toCommit->setLogsChanged();
+		}
 
 		// Remove the key range from the vector, if defined
 		if (vecBackupKeys) {

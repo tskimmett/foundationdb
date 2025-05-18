@@ -297,6 +297,7 @@ ACTOR Future<Void> clusterWatchDatabase(ClusterControllerData* cluster,
 
 			collection = actorCollection(db->recoveryData->addActor.getFuture());
 			recoveryCore = clusterRecoveryCore(db->recoveryData);
+			cluster->recentHealthTriggeredRecoveryTime.push(now());
 
 			// Master failure detection is pretty sensitive, but if we are in the middle of a very long recovery we
 			// really don't want to have to start over
@@ -600,6 +601,14 @@ bool isHealthySingleton(ClusterControllerData* self,
 	    self->isUsedNotMaster(currWorker.details.interf.locality.processId()) || bestFitness < currFitness ||
 	    (currFitness == bestFitness && currWorker.details.interf.locality.processId() == self->masterProcessId &&
 	     newWorker.interf.locality.processId() != self->masterProcessId);
+	if (g_network->isSimulated() && singleton.getRole() == Role::DATA_DISTRIBUTOR &&
+	    SERVER_KNOBS->CC_ENFORCE_USE_UNFIT_DD_IN_SIM) {
+		// It is possible that DD location is not optimal in the simulation.
+		// This can cause the simulation stuck if it always halts DD.
+		// TODO(BulkLoad): this is a work around. We should figure out why DD can be repeatedly
+		// terminated by CC throughout the simulation.
+		shouldRerecruit = false;
+	}
 	if (shouldRerecruit) {
 		std::string roleAbbr = singleton.getRole().abbreviation;
 		TraceEvent(("CCHalt" + roleAbbr).c_str(), self->id)
@@ -3061,7 +3070,6 @@ ACTOR Future<Void> workerHealthMonitor(ClusterControllerData* self) {
 				if (self->shouldTriggerRecoveryDueToDegradedServers()) {
 					if (SERVER_KNOBS->CC_HEALTH_TRIGGER_RECOVERY) {
 						if (self->recentRecoveryCountDueToHealth() < SERVER_KNOBS->CC_MAX_HEALTH_RECOVERY_COUNT) {
-							self->recentHealthTriggeredRecoveryTime.push(now());
 							self->excludedDegradedServers.clear();
 							for (const auto& degradedServer : self->degradationInfo.degradedServers) {
 								self->excludedDegradedServers[degradedServer] = now();
@@ -3071,8 +3079,15 @@ ACTOR Future<Void> workerHealthMonitor(ClusterControllerData* self) {
 							}
 							invalidateExcludedProcessComplaints(self);
 							TraceEvent(SevWarnAlways, "DegradedServerDetectedAndTriggerRecovery")
-							    .detail("RecentRecoveryCountDueToHealth", self->recentRecoveryCountDueToHealth());
+							    .detail("RecentRecoveryCountDueToHealth", self->recentRecoveryCountDueToHealth())
+							    .detail("DegradedServers", degradedServerString)
+							    .detail("DisconnectedServers", disconnectedServerString)
+							    .detail("DegradedSatellite", self->degradationInfo.degradedSatellite);
 							self->db.forceMasterFailure.trigger();
+						} else {
+							TraceEvent(SevWarnAlways, "RecentRecoveryCountHigh")
+							    .suppressFor(1.0)
+							    .detail("RecentRecoveryCountDueToHealth", self->recentRecoveryCountDueToHealth());
 						}
 					} else {
 						self->excludedDegradedServers.clear();

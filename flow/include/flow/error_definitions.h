@@ -109,7 +109,6 @@ ERROR( dd_config_changed, 1084, "DataDistribution configuration changed." )
 ERROR( consistency_check_urgent_task_failed, 1085, "Consistency check urgent task is failed")
 ERROR( data_move_conflict, 1086, "Data move conflict in SS")
 ERROR( consistency_check_urgent_duplicate_request, 1087, "Consistency check urgent got a duplicate request")
-ERROR( consistency_check_urgent_conflicting_request, 1088, "Consistency check urgent can process 1 workload at a time")
 
 ERROR( broken_promise, 1100, "Broken promise" )
 ERROR( operation_cancelled, 1101, "Asynchronous operation cancelled" )
@@ -162,6 +161,10 @@ ERROR( range_lock_failed, 1241, "Lock range failed" )
 ERROR( transaction_rejected_range_locked, 1242, "Transaction rejected due to range lock" )
 ERROR( bulkdump_task_failed, 1243, "Bulk dumping task failed" )
 ERROR( bulkdump_task_outdated, 1244, "Bulk dumping task outdated" )
+ERROR( bulkload_fileset_invalid_filepath, 1245, "Bulkload fileset provides invalid filepath" )
+ERROR( bulkload_manifest_decode_error, 1246, "Bulkload manifest string is failed to decode" )
+ERROR( range_lock_reject, 1247, "Range lock is rejected" )
+ERROR( range_unlock_reject, 1248, "Range unlock is rejected" )
 
 // 15xx Platform errors
 ERROR( platform_error, 1500, "Platform error" )
@@ -192,7 +195,7 @@ ERROR( lock_file_failure, 1529, "Unable to lock the file")
 ERROR( rest_unsupported_protocol, 1530, "Unsupported REST protocol")
 ERROR( rest_malformed_response, 1531, "Malformed REST response")
 ERROR( rest_max_base_cipher_len, 1532, "Max BaseCipher length violation")
-
+ERROR( resource_not_found, 1533, "Requested resource was not found" )
 
 // 2xxx Attempt (presumably by a _client_) to do something illegal.  If an error is known to
 // be internally caused, it should be 41xx

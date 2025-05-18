@@ -199,7 +199,7 @@ public:
 	// Random selection for load balance
 	ACTOR static Future<Void> getTeamForBulkLoad(DDTeamCollection* self, GetTeamRequest req) {
 		try {
-			TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamReqReceived", self->distributorId)
+			TraceEvent(bulkLoadVerboseEventSev(), "DDBulkLoadEngineTaskGetTeamReqReceived", self->distributorId)
 			    .detail("TCReady", self->readyToStart.isReady())
 			    .detail("TeamBuilderValid", self->teamBuilder.isValid())
 			    .detail("TeamBuilderReady", self->teamBuilder.isValid() ? self->teamBuilder.isReady() : false)
@@ -208,7 +208,7 @@ public:
 			    .detail("TeamSize", self->teams.size());
 			wait(self->checkBuildTeams());
 
-			TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamCheckBuildTeamDone", self->distributorId)
+			TraceEvent(bulkLoadVerboseEventSev(), "DDBulkLoadEngineTaskGetTeamCheckBuildTeamDone", self->distributorId)
 			    .detail("TCReady", self->readyToStart.isReady())
 			    .detail("TeamBuilderValid", self->teamBuilder.isValid())
 			    .detail("TeamBuilderReady", self->teamBuilder.isValid() ? self->teamBuilder.isReady() : false)
@@ -221,7 +221,7 @@ public:
 				// a data movement to that team can't be completed and such a move
 				// may block the primary DC from reaching "storage_recovered".
 				auto team = self->findTeamFromServers(req.completeSources, /*wantHealthy=*/false);
-				TraceEvent(SevWarn, "DDBulkLoadTaskGetTeamRemoteDCNotReady", self->distributorId)
+				TraceEvent(SevWarn, "DDBulkLoadEngineTaskGetTeamRemoteDCNotReady", self->distributorId)
 				    .suppressFor(1.0)
 				    .detail("Primary", self->primary)
 				    .detail("Team", team.present() ? describe(team.get()->getServerIDs()) : "");
@@ -231,7 +231,8 @@ public:
 
 			self->updateTeamPivotValues();
 
-			std::vector<Reference<TCTeamInfo>> candidateTeams;
+			// Step 1: find all valid teams from team collection
+			std::vector<Reference<TCTeamInfo>> validTeams;
 			int unhealthyTeamCount = 0;
 			int notEligibileTeamCount = 0;
 			int duplicatedCount = 0;
@@ -240,18 +241,25 @@ public:
 					unhealthyTeamCount++;
 					continue;
 				}
-				bool allDestServerHaveLowDiskUtil =
-				    dest->getEligibilityCount(data_distribution::EligibilityCounter::LOW_DISK_UTIL) > 0;
-				if (!allDestServerHaveLowDiskUtil) {
-					notEligibileTeamCount++;
-					continue;
+				// In the simulation, the available disk space is simulated randomly.
+				// So, it is possible that a random low disk space can cause the bulkload test
+				// stuck at failing to get an eligible team.
+				// We still want to have this low disk space check in the simulation, but we
+				// do not want this check blocking the simulation. So, we randomly do the check.
+				if (!g_network->isSimulated() || deterministicRandom()->random01() < 0.5) {
+					bool anyDestServerHaveLowDiskUtil =
+					    dest->getEligibilityCount(data_distribution::EligibilityCounter::LOW_DISK_UTIL) > 0;
+					if (!anyDestServerHaveLowDiskUtil) {
+						notEligibileTeamCount++;
+						continue;
+					}
 				}
 				bool ok = true;
 				for (const auto& srcId : req.src) {
 					std::vector<UID> serverIds = dest->getServerIDs();
 					for (const auto& serverId : serverIds) {
 						if (serverId == srcId) {
-							ok = false; // Do not select a team that has a server owning the bulk loading range
+							ok = false; // Do not select a team that has a server owning the bulk loading range.
 							break;
 						}
 					}
@@ -263,29 +271,53 @@ public:
 					duplicatedCount++;
 					continue;
 				}
-				candidateTeams.push_back(dest);
+				validTeams.push_back(dest);
 			}
+
+			// Step 2: Conduct Power-of-D-Choice to select a team
+			std::vector<Reference<TCTeamInfo>> candidateTeams;
+			if (validTeams.size() <= SERVER_KNOBS->DD_BULKLOAD_POWER_OF_D_RATIO) {
+				candidateTeams = validTeams;
+			} else {
+				deterministicRandom()->randomShuffle(validTeams);
+				candidateTeams = std::vector<Reference<TCTeamInfo>>(
+				    validTeams.begin(),
+				    validTeams.begin() + std::floor(validTeams.size() / SERVER_KNOBS->DD_BULKLOAD_POWER_OF_D_RATIO));
+			}
+
 			Optional<Reference<IDataDistributionTeam>> res;
-			if (candidateTeams.size() >= 1) {
-				res = deterministicRandom()->randomChoice(candidateTeams);
-				TraceEvent(SevInfo, "DDBulkLoadTaskGetTeamReply", self->distributorId)
+			int minOngoingBulkLoadTaskCount = std::numeric_limits<int>::max();
+			for (int i = 0; i < candidateTeams.size(); i++) {
+				int ongoingBulkLoadTaskCount = -1;
+				for (const auto& ssid : candidateTeams[i]->getServerIDs()) {
+					ongoingBulkLoadTaskCount =
+					    std::max(ongoingBulkLoadTaskCount, self->bulkLoadTaskCollection->busyMap.getTaskCount(ssid));
+				}
+				if (!res.present() || ongoingBulkLoadTaskCount < minOngoingBulkLoadTaskCount) {
+					minOngoingBulkLoadTaskCount = ongoingBulkLoadTaskCount;
+					res = candidateTeams[i];
+				}
+			}
+
+			if (res.present()) {
+				TraceEvent(bulkLoadVerboseEventSev(), "DDBulkLoadEngineTaskGetTeamReply", self->distributorId)
 				    .detail("TCReady", self->readyToStart.isReady())
 				    .detail("SrcIds", describe(req.src))
 				    .detail("Primary", self->isPrimary())
 				    .detail("TeamSize", self->teams.size())
-				    .detail("CandidateSize", candidateTeams.size())
+				    .detail("ValidTeamSize", validTeams.size())
 				    .detail("UnhealthyTeamCount", unhealthyTeamCount)
 				    .detail("DuplicatedCount", duplicatedCount)
 				    .detail("NotEligibileTeamCount", notEligibileTeamCount)
 				    .detail("DestIds", describe(res.get()->getServerIDs()))
 				    .detail("DestTeam", res.get()->getTeamID());
 			} else {
-				TraceEvent(SevWarnAlways, "DDBulkLoadTaskGetTeamFailedToFindValidTeam", self->distributorId)
+				TraceEvent(SevWarnAlways, "DDBulkLoadEngineTaskGetTeamFailedToFindValidTeam", self->distributorId)
 				    .detail("TCReady", self->readyToStart.isReady())
 				    .detail("SrcIds", describe(req.src))
 				    .detail("Primary", self->isPrimary())
 				    .detail("TeamSize", self->teams.size())
-				    .detail("CandidateSize", candidateTeams.size())
+				    .detail("ValidTeamSize", validTeams.size())
 				    .detail("UnhealthyTeamCount", unhealthyTeamCount)
 				    .detail("DuplicatedCount", duplicatedCount)
 				    .detail("NotEligibileTeamCount", notEligibileTeamCount);
@@ -2290,7 +2322,7 @@ public:
 			self->getAverageShardBytes.send(avgShardBytes);
 			int64_t avgBytes = wait(avgShardBytes.getFuture());
 			double ratio;
-			bool imbalance;
+			bool imbalance, noMinAvailSpace;
 			int numSSToBeLoadBytesBalanced;
 
 			if (SERVER_KNOBS->PW_MAX_SS_LESSTHAN_MIN_BYTES_BALANCE_RATIO) {
@@ -2310,9 +2342,12 @@ public:
 			}
 			CODE_PROBE(imbalance, "Perpetual Wiggle pause because cluster is imbalance.");
 
+			noMinAvailSpace =
+			    !self->allServersHaveMinAvailableSpace(SERVER_KNOBS->PERPETUAL_WIGGLE_MIN_AVAILABLE_SPACE_RATIO);
+
 			// there must not have other teams to place wiggled data
 			takeRest = self->server_info.size() <= self->configuration.storageTeamSize ||
-			           self->machine_info.size() < self->configuration.storageTeamSize || imbalance;
+			           self->machine_info.size() < self->configuration.storageTeamSize || imbalance || noMinAvailSpace;
 
 			if (SERVER_KNOBS->PERPETUAL_WIGGLE_PAUSE_AFTER_TSS_TARGET_MET &&
 			    self->configuration.storageMigrationType == StorageMigrationType::DEFAULT) {
@@ -2335,6 +2370,7 @@ public:
 				    .detail("StorageTeamSize", self->configuration.storageTeamSize)
 				    .detail("TargetTSSInDC", self->getTargetTSSInDC())
 				    .detail("ReachTSSPairTarget", self->reachTSSPairTarget())
+				    .detail("NoMinAvailableSpace", noMinAvailSpace)
 				    .detail("MigrationType", self->configuration.storageMigrationType.toString());
 			}
 		}
@@ -3337,9 +3373,9 @@ public:
 		    StorageMetadataType::currentTime(),
 		    server->getStoreType(),
 		    !(server->isCorrectStoreType(isTss ? self->configuration.testingStorageServerStoreType
-		                                       : self->configuration.storageServerStoreType) ||
-		      server->isCorrectStoreType(isTss ? self->configuration.testingStorageServerStoreType
-		                                       : self->configuration.perpetualStoreType)));
+		                                       : (self->configuration.perpetualStoreType.isValid()
+		                                              ? self->configuration.perpetualStoreType
+		                                              : self->configuration.storageServerStoreType))));
 
 		// read storage metadata
 		loop {
@@ -3834,7 +3870,11 @@ void DDTeamCollection::updateTeamEligibility() {
 			    .detail("TeamId", team->getTeamID())
 			    .detail("CPU", team->getAverageCPU())
 			    .detail("AvailableSpace", team->getMinAvailableSpace())
-			    .detail("AvailableSpaceRatio", team->getMinAvailableSpaceRatio());
+			    .detail("AvailableSpaceRatio", team->getMinAvailableSpaceRatio())
+			    .detail("LowDiskUtil", lowDiskUtil)
+			    .detail("LowCPU", lowCPU)
+			    .detail("PivotSpace", teamPivots.pivotAvailableSpaceRatio)
+			    .detail("PivotCPU", teamPivots.pivotCPU);
 
 			if (lowDiskUtil) {
 				lowDiskUtilTotal++;
@@ -4089,6 +4129,23 @@ bool DDTeamCollection::isCorrectDC(TCServerInfo const& server) const {
 
 Future<Void> DDTeamCollection::removeBadTeams() {
 	return DDTeamCollectionImpl::removeBadTeams(this);
+}
+
+bool DDTeamCollection::allServersHaveMinAvailableSpace(double minAvailableSpaceRatio) const {
+	for (auto& [id, s] : server_info) {
+		// If a healthy SS don't have storage metrics, skip this round
+		if (server_status.get(s->getId()).isUnhealthy() || !s->metricsPresent()) {
+			TraceEvent(SevDebug, "AllServersHaveMinAvailableSpaceNoMetrics").detail("Server", id);
+			return false;
+		}
+
+		if (!s->hasHealthyAvailableSpace(minAvailableSpaceRatio)) {
+			TraceEvent(SevDebug, "AllServersHaveMinAvailableSpaceNotTrue").detail("Server", id);
+			return false;
+		}
+	}
+
+	return true;
 }
 
 double DDTeamCollection::loadBytesBalanceRatio(int64_t smallLoadThreshold) const {
@@ -4382,7 +4439,8 @@ DDTeamCollection::DDTeamCollection(DDTeamCollectionInitParams const& params)
     storageServerRecruitmentEventHolder(
         makeReference<EventCacheHolder>("StorageServerRecruitment_" + params.distributorId.toString())),
     primary(params.primary), distributorId(params.distributorId), underReplication(false),
-    configuration(params.configuration), storageServerSet(new LocalityMap<UID>()) {
+    configuration(params.configuration), storageServerSet(new LocalityMap<UID>()),
+    bulkLoadTaskCollection(params.bulkLoadTaskCollection) {
 
 	if (!primary || configuration.usableRegions == 1) {
 		TraceEvent("DDTrackerStarting", distributorId)
@@ -6166,7 +6224,8 @@ public:
 		                                                     Promise<UID>(),
 		                                                     PromiseStream<Promise<int>>(),
 		                                                     PromiseStream<Promise<int64_t>>(),
-		                                                     PromiseStream<RebalanceStorageQueueRequest>() }));
+		                                                     PromiseStream<RebalanceStorageQueueRequest>(),
+		                                                     makeReference<BulkLoadTaskCollection>(UID(0, 0)) }));
 
 		for (int id = 1; id <= processCount; ++id) {
 			UID uid(id, 0);
@@ -6220,7 +6279,8 @@ public:
 		                                                     Promise<UID>(),
 		                                                     PromiseStream<Promise<int>>(),
 		                                                     PromiseStream<Promise<int64_t>>(),
-		                                                     PromiseStream<RebalanceStorageQueueRequest>() }));
+		                                                     PromiseStream<RebalanceStorageQueueRequest>(),
+		                                                     makeReference<BulkLoadTaskCollection>(UID(0, 0)) }));
 
 		for (int id = 1; id <= processCount; id++) {
 			UID uid(id, 0);

@@ -55,15 +55,29 @@ RUN curl -Ls https://github.com/krallin/tini/releases/download/v0.19.0/tini-arm6
 
 WORKDIR /
 
-FROM golang:1.22.5-bullseye AS go-build
+FROM docker.io/library/golang:1.23.8-bullseye AS go-build
 
 COPY fdbkubernetesmonitor/ /fdbkubernetesmonitor
 WORKDIR /fdbkubernetesmonitor
 RUN go build -o /fdb-kubernetes-monitor *.go
+COPY fdb-aws-s3-credentials-fetcher/ /fdb-aws-s3-credentials-fetcher
+WORKDIR /fdb-aws-s3-credentials-fetcher
+RUN go build -o /fdb-aws-s3-credentials-fetcher *.go
+
+# For now use 'base'. Later, could use a more stripped down image
+# since this script needs little.
+FROM base AS fdb-aws-s3-credentials-fetcher-sidecar
+RUN groupadd --gid 4059 fdb && \
+    useradd --gid 4059 \
+            --uid 4059 \
+            --no-create-home \
+            --shell /bin/bash fdb
+USER fdb
+COPY --from=go-build /fdb-aws-s3-credentials-fetcher /usr/bin/
+ENTRYPOINT ["/usr/bin/fdb-aws-s3-credentials-fetcher", "-dir", "/var/fdb"]
 
 FROM base AS foundationdb-base
 
-WORKDIR /tmp
 ARG FDB_VERSION=6.3.22
 ARG FDB_LIBRARY_VERSIONS="${FDB_VERSION}"
 ARG FDB_WEBSITE=https://github.com/apple/foundationdb/releases/download
@@ -82,6 +96,7 @@ RUN groupadd --gid 4059 \
             fdb && \
     chown -R fdb:fdb /var/fdb
 
+WORKDIR /tmp
 COPY website /tmp/website/
 
 # Install FoundationDB Binaries
@@ -93,8 +108,10 @@ RUN for file in fdbserver fdbbackup fdbcli fdbmonitor; do \
 
 # Setup all symlinks for the other binaries that are a copy of fdbbackup
 RUN for file in fdbdr fdbrestore backup_agent dr_agent fastrestore_tool; do \
-        ln -s /usr/bin/fdbbackup /usr/bin/$file; \
-    done
+        ln -s /usr/bin/fdbbackup "/usr/bin/$file"; \
+    done && \
+    cd / && \
+    rm -rf /tmp/*
 
 # Install additional FoundationDB Client Libraries
 RUN for version in $FDB_LIBRARY_VERSIONS; do \
@@ -139,7 +156,7 @@ RUN microdnf -y install \
     python3 -m pip install watchdog==4.0.1
 
 WORKDIR /
-ADD entrypoint.bash sidecar.py /
+COPY entrypoint.bash sidecar.py /
 RUN chmod a+x /entrypoint.bash /sidecar.py
 USER fdb
 VOLUME /var/input-files
@@ -160,7 +177,7 @@ RUN curl -LsO https://raw.githubusercontent.com/brendangregg/FlameGraph/90533539
     rm -rf /tmp/*
 WORKDIR /
 # Set Up Runtime Scripts and Directories
-ADD fdb.bash fdb_single.bash /var/fdb/scripts/
+COPY fdb.bash fdb_single.bash /var/fdb/scripts/
 RUN chmod a+x /var/fdb/scripts/fdb.bash /var/fdb/scripts/fdb_single.bash
 VOLUME /var/fdb/data
 ENV FDB_PORT=4500

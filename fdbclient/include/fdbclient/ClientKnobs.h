@@ -185,6 +185,7 @@ public:
 	int RESTORE_DISPATCH_ADDTASK_SIZE;
 	int RESTORE_DISPATCH_BATCH_SIZE;
 	int RESTORE_WRITE_TX_SIZE;
+	int RESTORE_PARTITIONED_BATCH_VERSION_SIZE;
 	int APPLY_MAX_LOCK_BYTES;
 	int APPLY_MIN_LOCK_BYTES;
 	int APPLY_BLOCK_SIZE;
@@ -200,6 +201,12 @@ public:
 	bool BACKUP_CONTAINER_LOCAL_ALLOW_RELATIVE_PATH;
 	bool ENABLE_REPLICA_CONSISTENCY_CHECK_ON_BACKUP_READS;
 	int CONSISTENCY_CHECK_REQUIRED_REPLICAS;
+	int BULKLOAD_JOB_HISTORY_COUNT_MAX; // the max number of bulk load job history to keep. The oldest job history will
+	                                    // be removed when the count exceeds this value. Set to 0 to disable history.
+	                                    // Do not set the value to a large number, e.g. <= 10.
+	int BULKLOAD_VERBOSE_LEVEL; // Set to 1 to minimize the verbosity. Set to 5 to turn on all events for performance
+	                            // insights. Set to 10 to turn on all events.
+	int S3CLIENT_VERBOSE_LEVEL; // Similar to BULKLOAD_VERBOSE_LEVEL
 
 	// Configuration
 	int32_t DEFAULT_AUTO_COMMIT_PROXIES;
@@ -239,6 +246,7 @@ public:
 	int BLOBSTORE_CONCURRENT_REQUESTS;
 	int BLOBSTORE_MULTIPART_MAX_PART_SIZE;
 	int BLOBSTORE_MULTIPART_MIN_PART_SIZE;
+	int BLOBSTORE_MULTIPART_RETRY_DELAY_MS;
 	int BLOBSTORE_CONCURRENT_UPLOADS;
 	int BLOBSTORE_CONCURRENT_LISTS;
 	int BLOBSTORE_CONCURRENT_WRITES_PER_FILE;
@@ -256,7 +264,17 @@ public:
 	double BLOBSTORE_LATENCY_LOGGING_ACCURACY;
 	int BLOBSTORE_MAX_DELAY_RETRYABLE_ERROR;
 	int BLOBSTORE_MAX_DELAY_CONNECTION_FAILED;
-
+	bool
+	    BLOBSTORE_ENABLE_OBJECT_INTEGRITY_CHECK; // Enable integrity check of download. When not set, on upload, we
+	                                             // we volunteer an md5 of the content and upload will fail if our
+	                                             // md5 doesn't match that calculated by the server. When this flag
+	                                             // is set, we hash the content using sha256 and have the server store
+	                                             // the hash in the object metadata. On download, if this flag is set
+	                                             // we will check the serverside proffered hash against that we
+	                                             // calculate on the received content.  If no match, throw an error. See
+	                                             // https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html
+	                                             // (We can't depend on etags in the download because they are not the
+	                                             // md5 of the content when the upload uses encryption such as aws:kms)
 	int CONSISTENCY_CHECK_RATE_LIMIT_MAX; // Available in both normal and urgent mode
 	int CONSISTENCY_CHECK_ONE_ROUND_TARGET_COMPLETION_TIME; // Available in normal mode
 	int CONSISTENCY_CHECK_URGENT_NEXT_WAIT_TIME; // Available in urgent mode

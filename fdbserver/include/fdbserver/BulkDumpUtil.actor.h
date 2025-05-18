@@ -31,11 +31,24 @@
 #include "fdbclient/StorageServerInterface.h"
 #include "flow/actorcompiler.h" // has to be last include
 
+struct RangeDumpRawData {
+	std::map<Key, Value> kvs;
+	std::map<Key, Value> sampled;
+	Key lastKey;
+	int64_t kvsBytes;
+	RangeDumpRawData() = default;
+	RangeDumpRawData(const std::map<Key, Value>& kvs,
+	                 const std::map<Key, Value>& sampled,
+	                 const Key& lastKey,
+	                 int64_t kvsBytes)
+	  : kvs(kvs), sampled(sampled), lastKey(lastKey), kvsBytes(kvsBytes) {}
+};
+
 struct SSBulkDumpTask {
 	SSBulkDumpTask(const StorageServerInterface& targetServer,
 	               const std::vector<UID>& checksumServers,
 	               const BulkDumpState& bulkDumpState)
-	  : targetServer(targetServer), checksumServers(checksumServers), bulkDumpState(bulkDumpState){};
+	  : targetServer(targetServer), checksumServers(checksumServers), bulkDumpState(bulkDumpState) {};
 
 	std::string toString() const {
 		return "[BulkDumpState]: " + bulkDumpState.toString() + ", [TargetServer]: " + targetServer.toString() +
@@ -63,7 +76,7 @@ std::string generateRandomBulkDumpDataFileName(Version version);
 //	<rootRemote>/<relativeFolder>/<dumpVersion>-manifest.txt (must have)
 //	<rootRemote>/<relativeFolder>/<dumpVersion>-data.sst (omitted for empty range)
 //	<rootRemote>/<relativeFolder>/<dumpVersion>-sample.sst (omitted if data size is too small to have a sample)
-std::pair<BulkDumpFileSet, BulkDumpFileSet> getLocalRemoteFileSetSetting(Version dumpVersion,
+std::pair<BulkLoadFileSet, BulkLoadFileSet> getLocalRemoteFileSetSetting(Version dumpVersion,
                                                                          const std::string& relativeFolder,
                                                                          const std::string& rootLocal,
                                                                          const std::string& rootRemote);
@@ -75,56 +88,42 @@ ACTOR Future<Void> persistCompleteBulkDumpRange(Database cx, BulkDumpState bulkD
 // Define bulk dump job folder. Job is set by user. At most one job at a time globally.
 std::string generateBulkDumpJobFolder(const UID& jobId);
 
-// Define job manifest file name.
-std::string getJobManifestFileName(const UID& jobId);
-
 // Define task folder name.
-std::string getBulkDumpTaskFolder(const UID& taskId);
+std::string getBulkDumpJobTaskFolder(const UID& jobId, const UID& taskId);
 
 // Define job root folder.
-std::string getBulkDumpJobRoot(const std::string& root, const UID& jobId);
+std::string getBulkLoadJobRoot(const std::string& root, const UID& jobId);
 
-// Define job manifest file content based on job's all BulkDumpManifest.
-// Each row is a range sorted by the beginKey. Any two ranges do not have overlapping.
-// Col: beginKey, endKey, dataVersion, dataBytes, manifestPath.
-// dataVersion should be always valid. dataBytes can be 0 in case of an empty range.
-std::string generateJobManifestFileContent(const std::map<Key, BulkDumpManifest>& manifests);
-
+// Generate key-value data, byte sampling data, and manifest file.
+// Return BulkLoadManifest metadata (equivalent to content of the manifest file).
+// TODO(BulkDump): can cause slow tasks, do the task in a separate thread in the future.
 // The size of sortedData is defined at the place of generating the data (getRangeDataToDump).
 // The size is configured by MOVE_SHARD_KRM_ROW_LIMIT.
-BulkDumpManifest dumpDataFileToLocalDirectory(UID logId,
-                                              const std::map<Key, Value>& sortedData,
-                                              const std::map<Key, Value>& sortedSample,
-                                              const BulkDumpFileSet& localFileSet,
-                                              const BulkDumpFileSet& remoteFileSet,
-                                              const ByteSampleSetting& byteSampleSetting,
-                                              Version dumpVersion,
-                                              const KeyRange& dumpRange,
-                                              int64_t dumpBytes);
-
-void generateBulkDumpJobManifestFile(const std::string& workFolder,
-                                     const std::string& localJobManifestFilePath,
-                                     const std::string& content,
-                                     const UID& logId);
+ACTOR Future<BulkLoadManifest> dumpDataFileToLocalDirectory(UID logId,
+                                                            std::shared_ptr<RangeDumpRawData> rangeDumpRawData,
+                                                            BulkLoadFileSet localFileSet,
+                                                            BulkLoadFileSet remoteFileSet,
+                                                            BulkLoadByteSampleSetting byteSampleSetting,
+                                                            Version dumpVersion,
+                                                            KeyRange dumpRange,
+                                                            BulkLoadType dumpType,
+                                                            BulkLoadTransportMethod transportMethod);
 
 // Upload manifest file for bulkdump job
 // Each job has one manifest file including manifest paths of all tasks.
 // The local file path:	<localRootLocal>/<jobId>-manifest.txt
 // The remote file folder and the name of the file in the remote folder.
-ACTOR Future<Void> uploadBulkDumpJobManifestFile(BulkDumpTransportMethod transportMethod,
+ACTOR Future<Void> uploadBulkDumpJobManifestFile(BulkLoadTransportMethod transportMethod,
                                                  std::string localJobManifestFilePath,
                                                  std::string remoteFolder,
                                                  std::string jobManifestFileName,
                                                  UID logId);
 
 // Upload file for each task. Each task is spawned by bulkdump job according to the shard boundary
-ACTOR Future<Void> uploadBulkDumpFileSet(BulkDumpTransportMethod transportMethod,
-                                         BulkDumpFileSet sourceFileSet,
-                                         BulkDumpFileSet destinationFileSet,
+ACTOR Future<Void> uploadBulkDumpFileSet(BulkLoadTransportMethod transportMethod,
+                                         BulkLoadFileSet sourceFileSet,
+                                         BulkLoadFileSet destinationFileSet,
                                          UID logId);
-
-// Erase file folder
-void clearFileFolder(const std::string& folderPath);
 
 class ParallelismLimitor {
 public:
@@ -136,10 +135,15 @@ public:
 		ASSERT(numRunningTasks.get() >= 0);
 	}
 
+	inline void incrementTaskCounter() {
+		ASSERT(numRunningTasks.get() < maxParallelism);
+		numRunningTasks.set(numRunningTasks.get() + 1);
+		ASSERT(numRunningTasks.get() <= maxParallelism);
+	}
+
 	// return true if succeed
-	inline bool tryIncrementTaskCounter() {
+	inline bool canStart() {
 		if (numRunningTasks.get() < maxParallelism) {
-			numRunningTasks.set(numRunningTasks.get() + 1);
 			return true;
 		} else {
 			return false;

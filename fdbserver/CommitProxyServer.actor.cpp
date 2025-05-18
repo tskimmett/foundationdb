@@ -124,6 +124,7 @@ struct ResolutionRequestBuilder {
 	                         Version version,
 	                         Version prevVersion,
 	                         Version lastReceivedVersion,
+	                         Version lastShardMove,
 	                         Span& parentSpan)
 	  : self(self), requests(self->resolvers.size()) {
 		for (auto& req : requests) {
@@ -131,6 +132,7 @@ struct ResolutionRequestBuilder {
 			req.prevVersion = prevVersion;
 			req.version = version;
 			req.lastReceivedVersion = lastReceivedVersion;
+			req.lastShardMove = lastShardMove;
 		}
 	}
 
@@ -525,8 +527,9 @@ ACTOR Future<Void> addBackupMutations(ProxyCommitData* self,
 	// Serialize the log range mutations within the map
 	for (; logRangeMutation != logRangeMutations->cend(); ++logRangeMutation) {
 		// FIXME: this is re-implementing the serialize function of MutationListRef in order to have a yield
+		// this is 0x0FDB00A200090001
 		valueWriter = BinaryWriter(IncludeVersion(ProtocolVersion::withBackupMutations()));
-		valueWriter << logRangeMutation->second.totalSize();
+		valueWriter << logRangeMutation->second.totalSize(); // this is int32 by default
 
 		state MutationListRef::Blob* blobIter = logRangeMutation->second.blob_begin;
 		while (blobIter) {
@@ -545,7 +548,7 @@ ACTOR Future<Void> addBackupMutations(ProxyCommitData* self,
 
 		Key val = valueWriter.toValue();
 
-		BinaryWriter wr(Unversioned());
+		BinaryWriter wr(Unversioned()); // backupName/hash/commitVersion/part, so wr is param1
 
 		// Serialize the log destination
 		wr.serializeBytes(logRangeMutation->first);
@@ -561,23 +564,10 @@ ACTOR Future<Void> addBackupMutations(ProxyCommitData* self,
 			MutationRef backupMutation;
 			backupMutation.type = MutationRef::SetValue;
 			// Assign the second parameter as the part
-			backupMutation.param2 = val.substr(
-			    part * CLIENT_KNOBS->MUTATION_BLOCK_SIZE,
-			    std::min(val.size() - part * CLIENT_KNOBS->MUTATION_BLOCK_SIZE, CLIENT_KNOBS->MUTATION_BLOCK_SIZE));
-
-			// Write the last part of the mutation to the serialization, if the buffer is not defined
-			if (!partBuffer) {
-				// Serialize the part to the writer
-				wr << bigEndian32(part);
-
-				// Define the last buffer part
-				partBuffer = (uint32_t*)((char*)wr.getData() + wr.getLength() - sizeof(uint32_t));
-			} else {
-				*partBuffer = bigEndian32(part);
-			}
-
 			// Define the mutation type and and location
-			backupMutation.param1 = wr.toValue();
+			backupMutation.param2 = getBackupValue(val, part);
+			Key key = getBackupKey(wr, &partBuffer, part); // holds the memory for backupMutation
+			backupMutation.param1 = key;
 			ASSERT(backupMutation.param1.startsWith(
 			    logRangeMutation->first)); // We are writing into the configured destination
 
@@ -740,6 +730,8 @@ struct CommitBatchContext {
 
 	bool rangeLockEnabled();
 
+	Version lastShardMove;
+
 private:
 	void evaluateBatchSize();
 };
@@ -818,17 +810,24 @@ inline bool shouldBackup(MutationRef const& m) {
 	return false;
 }
 
+// Find the set of logs the batch is sent to. An empty set indicates it cannot be
+// determined. In version vector, this means the batch should be sent to all logs.
 std::set<Tag> CommitBatchContext::getWrittenTagsPreResolution() {
 	std::set<Tag> transactionTags;
 	std::vector<Tag> cacheVector = { cacheTag };
+	lastShardMove = pProxyCommitData->lastShardMove;
 	if (pProxyCommitData->txnStateStore->getReplaceContent()) {
-		// return empty set if txnStateStore will snapshot.
-		// empty sets are sent to all logs.
-		return transactionTags;
+		return std::set<Tag>();
+	}
+	if (pProxyCommitData->idempotencyClears.size()) {
+		return std::set<Tag>();
 	}
 	for (int transactionNum = 0; transactionNum < trs.size(); transactionNum++) {
 		int mutationNum = 0;
 		VectorRef<MutationRef>* pMutations = &trs[transactionNum].transaction.mutations;
+		if (trs[transactionNum].idempotencyId.valid()) {
+			return std::set<Tag>();
+		}
 		for (; mutationNum < pMutations->size(); mutationNum++) {
 			auto& m = (*pMutations)[mutationNum];
 			// disable version vector's effect if any mutation in the batch is backed up.
@@ -843,23 +842,20 @@ std::set<Tag> CommitBatchContext::getWrittenTagsPreResolution() {
 					transactionTags.insert(cacheTag);
 				}
 			} else if (m.type == MutationRef::ClearRange) {
-				KeyRangeRef clearRange(KeyRangeRef(m.param1, m.param2));
-				auto ranges = pProxyCommitData->keyInfo.intersectingRanges(clearRange);
-				auto firstRange = ranges.begin();
-				++firstRange;
-				if (firstRange == ranges.end()) {
-					std::set<Tag> filteredTags;
-					ranges.begin().value().populateTags();
-					filteredTags.insert(ranges.begin().value().tags.begin(), ranges.begin().value().tags.end());
-					transactionTags.insert(ranges.begin().value().tags.begin(), ranges.begin().value().tags.end());
+				auto range = pProxyCommitData->keyInfo.rangeContaining(m.param1);
+				if (range.end() >= m.param2) {
+					range.value().populateTags();
+					transactionTags.insert(range.value().tags.begin(), range.value().tags.end());
 				} else {
 					std::set<Tag> allSources;
-					for (auto r : ranges) {
-						r.value().populateTags();
-						allSources.insert(r.value().tags.begin(), r.value().tags.end());
-						transactionTags.insert(r.value().tags.begin(), r.value().tags.end());
+					while (range.begin() < m.param2) {
+						range.value().populateTags();
+						allSources.insert(range.value().tags.begin(), range.value().tags.end());
+						transactionTags.insert(range.value().tags.begin(), range.value().tags.end());
+						++range;
 					}
 				}
+				KeyRangeRef clearRange(KeyRangeRef(m.param1, m.param2));
 				if (pProxyCommitData->needsCacheTag(clearRange)) {
 					transactionTags.insert(cacheTag);
 				}
@@ -884,7 +880,7 @@ CommitBatchContext::CommitBatchContext(ProxyCommitData* const pProxyCommitData_,
     currentBatchMemBytesCount(currentBatchMemBytesCount), startTime(g_network->now()),
     localBatchNumber(++pProxyCommitData->localCommitBatchesStarted),
     toCommit(pProxyCommitData->logSystem, pProxyCommitData->localTLogCount), span("MP:commitBatch"_loc),
-    committed(trs.size()) {
+    committed(trs.size()), lastShardMove(invalidVersion) {
 
 	evaluateBatchSize();
 
@@ -1029,7 +1025,7 @@ ACTOR Future<Void> preresolutionProcessing(CommitBatchContext* self) {
 	self->commitVersion = versionReply.version;
 	self->prevVersion = versionReply.prevVersion;
 
-	//TraceEvent("CPGetVersion", pProxyCommitData->dbgid).detail("Master", pProxyCommitData->master.id().toString()).detail("CommitVersion", self->commitVersion).detail("PrvVersion", self->prevVersion);
+	// TraceEvent("CPGetVersion", pProxyCommitData->dbgid).detail("Master", pProxyCommitData->master.id().toString()).detail("CommitVersion", self->commitVersion).detail("PrvVersion", self->prevVersion);
 
 	for (auto it : versionReply.resolverChanges) {
 		auto rs = pProxyCommitData->keyResolvers.modify(it.range);
@@ -1105,8 +1101,12 @@ ACTOR Future<Void> getResolution(CommitBatchContext* self) {
 	std::vector<CommitTransactionRequest>& trs = self->trs;
 	state Span span("MP:getResolution"_loc, self->span.context);
 
-	ResolutionRequestBuilder requests(
-	    pProxyCommitData, self->commitVersion, self->prevVersion, pProxyCommitData->version.get(), span);
+	ResolutionRequestBuilder requests(pProxyCommitData,
+	                                  self->commitVersion,
+	                                  self->prevVersion,
+	                                  pProxyCommitData->version.get(),
+	                                  self->lastShardMove,
+	                                  span);
 	int conflictRangeCount = 0;
 	self->maxTransactionBytes = 0;
 	for (int t = 0; t < trs.size(); t++) {
@@ -1787,6 +1787,16 @@ ACTOR Future<Void> applyMetadataToCommittedTransactions(CommitBatchContext* self
 		if (SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST) {
 			// TraceEvent("ResolverReturn").detail("ReturnTags",reply.writtenTags).detail("TPCVsize",reply.tpcvMap.size()).detail("ReqTags",self->writtenTagsPreResolution);
 			self->tpcvMap = reply.tpcvMap;
+			self->pProxyCommitData->lastShardMove = reply.lastShardMove;
+
+			// extract push locations from tpcv
+			std::vector<int> fromLocations;
+			fromLocations.reserve(reply.tpcvMap.size());
+			for (const auto& pair : self->tpcvMap) {
+				fromLocations.push_back(pair.first);
+			}
+			// save push locations for each tag
+			self->toCommit.setPushLocationsForTags(fromLocations);
 		}
 		self->toCommit.addWrittenTags(reply.writtenTags);
 	}
@@ -2007,8 +2017,10 @@ void addAccumulativeChecksumMutations(CommitBatchContext* self) {
 			    .detail("AcsIndex", acsIndex)
 			    .detail("AcsToSend", acsToSend.toString())
 			    .detail("Mutation", acsMutation)
+			    .detail("Version", self->commitVersion)
 			    .detail("CommitProxyIndex", self->pProxyCommitData->commitProxyIndex);
 		}
+		DEBUG_MUTATION("ProxyCommit", self->commitVersion, acsMutation, self->pProxyCommitData->dbgid);
 		self->toCommit.addTag(tag);
 		self->toCommit.writeTypedMessage(acsMutation);
 	}
@@ -2168,22 +2180,19 @@ ACTOR Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 				ASSERT(std::holds_alternative<MutationRef>(var));
 				writtenMutation = std::get<MutationRef>(var);
 			} else if (m.type == MutationRef::ClearRange) {
-				KeyRangeRef clearRange(KeyRangeRef(m.param1, m.param2));
-				auto ranges = pProxyCommitData->keyInfo.intersectingRanges(clearRange);
-				auto firstRange = ranges.begin();
-				++firstRange;
-				if (firstRange == ranges.end()) {
+				auto range = pProxyCommitData->keyInfo.rangeContaining(m.param1);
+				if (range.end() >= m.param2) {
 					// Fast path
 					DEBUG_MUTATION("ProxyCommit", self->commitVersion, m, pProxyCommitData->dbgid)
-					    .detail("To", ranges.begin().value().tags);
-					ranges.begin().value().populateTags();
-					self->toCommit.addTags(ranges.begin().value().tags);
+					    .detail("To", range.value().tags);
+					range.value().populateTags();
+					self->toCommit.addTags(range.value().tags);
 
 					if (pProxyCommitData->acsBuilder != nullptr) {
 						updateMutationWithAcsAndAddMutationToAcsBuilder(
 						    pProxyCommitData->acsBuilder,
 						    m,
-						    ranges.begin().value().tags,
+						    range.value().tags,
 						    getCommitProxyAccumulativeChecksumIndex(pProxyCommitData->commitProxyIndex),
 						    pProxyCommitData->epoch,
 						    self->commitVersion,
@@ -2193,7 +2202,7 @@ ACTOR Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 					// check whether clear is sampled
 					if (checkSample && !trCost->get().clearIdxCosts.empty() &&
 					    trCost->get().clearIdxCosts[0].first == mutationNum) {
-						auto const& ssInfos = ranges.begin().value().src_info;
+						auto const& ssInfos = range.value().src_info;
 						for (auto const& ssInfo : ssInfos) {
 							auto id = ssInfo->interf.id();
 							pProxyCommitData->updateSSTagCost(id,
@@ -2206,14 +2215,14 @@ ACTOR Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 				} else {
 					CODE_PROBE(true, "A clear range extends past a shard boundary");
 					std::set<Tag> allSources;
-					for (auto r : ranges) {
-						r.value().populateTags();
-						allSources.insert(r.value().tags.begin(), r.value().tags.end());
+					while (range.begin() < m.param2) {
+						range.value().populateTags();
+						allSources.insert(range.value().tags.begin(), range.value().tags.end());
 
 						// check whether clear is sampled
 						if (checkSample && !trCost->get().clearIdxCosts.empty() &&
 						    trCost->get().clearIdxCosts[0].first == mutationNum) {
-							auto const& ssInfos = r.value().src_info;
+							auto const& ssInfos = range.value().src_info;
 							for (auto const& ssInfo : ssInfos) {
 								auto id = ssInfo->interf.id();
 								pProxyCommitData->updateSSTagCost(id,
@@ -2224,6 +2233,7 @@ ACTOR Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 							}
 							trCost->get().clearIdxCosts.pop_front();
 						}
+						++range;
 					}
 
 					DEBUG_MUTATION("ProxyCommit", self->commitVersion, m)
@@ -2243,6 +2253,7 @@ ACTOR Future<Void> assignMutationsToStorageServers(CommitBatchContext* self) {
 					}
 				}
 
+				KeyRangeRef clearRange(KeyRangeRef(m.param1, m.param2));
 				if (pProxyCommitData->needsCacheTag(clearRange)) {
 					self->toCommit.addTag(cacheTag);
 				}
@@ -2369,6 +2380,10 @@ ACTOR Future<Void> postResolution(CommitBatchContext* self) {
 		                        &self->computeStart));
 	}
 
+	// When version vector is enabled, idempotency entries should only be created or cleared
+	// if the operation was detected at pre resolution time. This ensures that the
+	// operation is broadcast to all logs, and does not lead to logs being included
+	// that are not part of the expected tag set (tpcv).
 	buildIdempotencyIdMutations(
 	    self->trs,
 	    self->idempotencyKVBuilder,
@@ -2382,6 +2397,8 @@ ACTOR Future<Void> postResolution(CommitBatchContext* self) {
 		    idempotencyIdSet.param1 = kv.key;
 		    idempotencyIdSet.param2 = kv.value;
 		    auto& tags = pProxyCommitData->tagsForKey(kv.key);
+		    ASSERT(!SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST ||
+		           pProxyCommitData->db->get().logSystemConfig.numLogs() == self->tpcvMap.size());
 		    self->toCommit.addTags(tags);
 		    if (self->pProxyCommitData->encryptMode.isEncryptionEnabled()) {
 			    CODE_PROBE(true, "encrypting idempotency mutation", probe::decoration::rare);
@@ -2405,27 +2422,31 @@ ACTOR Future<Void> postResolution(CommitBatchContext* self) {
 			    self->toCommit.writeTypedMessage(idempotencyIdSet);
 		    }
 	    });
-	state int i = 0;
-	for (i = 0; i < pProxyCommitData->idempotencyClears.size(); i++) {
-		auto& tags = pProxyCommitData->tagsForKey(pProxyCommitData->idempotencyClears[i].param1);
-		self->toCommit.addTags(tags);
-		// We already have an arena with an appropriate lifetime handy
-		Arena& arena = pProxyCommitData->idempotencyClears.arena();
-		if (pProxyCommitData->acsBuilder != nullptr) {
-			updateMutationWithAcsAndAddMutationToAcsBuilder(
-			    pProxyCommitData->acsBuilder,
-			    pProxyCommitData->idempotencyClears[i],
-			    tags,
-			    getCommitProxyAccumulativeChecksumIndex(pProxyCommitData->commitProxyIndex),
-			    pProxyCommitData->epoch,
-			    self->commitVersion,
-			    pProxyCommitData->dbgid);
+
+	if (!SERVER_KNOBS->ENABLE_VERSION_VECTOR_TLOG_UNICAST ||
+	    pProxyCommitData->db->get().logSystemConfig.numLogs() == self->tpcvMap.size()) {
+		state int i = 0;
+		for (i = 0; i < pProxyCommitData->idempotencyClears.size(); i++) {
+			auto& tags = pProxyCommitData->tagsForKey(pProxyCommitData->idempotencyClears[i].param1);
+			self->toCommit.addTags(tags);
+			// We already have an arena with an appropriate lifetime handy
+			Arena& arena = pProxyCommitData->idempotencyClears.arena();
+			if (pProxyCommitData->acsBuilder != nullptr) {
+				updateMutationWithAcsAndAddMutationToAcsBuilder(
+				    pProxyCommitData->acsBuilder,
+				    pProxyCommitData->idempotencyClears[i],
+				    tags,
+				    getCommitProxyAccumulativeChecksumIndex(pProxyCommitData->commitProxyIndex),
+				    pProxyCommitData->epoch,
+				    self->commitVersion,
+				    pProxyCommitData->dbgid);
+			}
+			WriteMutationRefVar var = wait(writeMutation(
+			    self, SYSTEM_KEYSPACE_ENCRYPT_DOMAIN_ID, &pProxyCommitData->idempotencyClears[i], nullptr, &arena));
+			ASSERT(std::holds_alternative<MutationRef>(var));
 		}
-		WriteMutationRefVar var = wait(writeMutation(
-		    self, SYSTEM_KEYSPACE_ENCRYPT_DOMAIN_ID, &pProxyCommitData->idempotencyClears[i], nullptr, &arena));
-		ASSERT(std::holds_alternative<MutationRef>(var));
+		pProxyCommitData->idempotencyClears = Standalone<VectorRef<MutationRef>>();
 	}
-	pProxyCommitData->idempotencyClears = Standalone<VectorRef<MutationRef>>();
 
 	self->toCommit.saveTags(self->writtenTags);
 
